@@ -1,0 +1,353 @@
+diff --git a/app/DshIOS/Models/AppModel.swift b/app/DshIOS/Models/AppModel.swift
+index 8df886a..3dd0ff1 100644
+--- a/app/DshIOS/Models/AppModel.swift
++++ b/app/DshIOS/Models/AppModel.swift
+@@ -69,6 +69,13 @@ struct Toast: Identifiable, Equatable {
+     static func == (lhs: Toast, rhs: Toast) -> Bool { lhs.id == rhs.id }
+ }
+ 
++/// A row's 删除 action: confirmed once, then run against the engine.
++struct DeleteSessionRequest: Identifiable {
++    let sessionId: String
++    let title: String
++    var id: String { sessionId }
++}
++
+ /// `workspace/session-active`: archiving waits for the user to stop the listed work.
+ struct ArchiveRequest: Identifiable {
+     let sessionId: String
+@@ -133,6 +140,7 @@ final class AppModel {
+     private(set) var supportMoment = 0
+     /// Shell dialogs the root view presents.
+     var archiveRequest: ArchiveRequest?
++    var deleteRequest: DeleteSessionRequest?
+     var renameRequest: RenameRequest?
+     var newSessionRequest: NewSessionRequest?
+     /// Start a session on a computer (the root view presents the sheet).
+diff --git a/app/DshIOS/Models/ShellActions.swift b/app/DshIOS/Models/ShellActions.swift
+index 3d3f36c..bd0c0c3 100644
+--- a/app/DshIOS/Models/ShellActions.swift
++++ b/app/DshIOS/Models/ShellActions.swift
+@@ -151,6 +151,45 @@ extension AppModel {
+         announceArchived(id, stopped: true)
+     }
+ 
++    /// 删除；it is gone from the drawer and from the engine's workspace registry.
++    /// The engine owns all three places (log, projection cache, registry), so the
++    /// app only asks and then re-reads the list.
++    func deleteSession(_ id: String) async {
++        var request = URLRequest(url: client.origin.appendingPathComponent("session-delete/delete"))
++        request.httpMethod = "POST"
++        request.setValue("application/json", forHTTPHeaderField: "content-type")
++        request.httpBody = try? JSONEncoder().encode(["sessionId": id])
++        do {
++            let (data, response) = try await client.session.data(for: request)
++            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
++            guard status == 200 else {
++                let failure = Self.deleteFailure(status: status, data: data)
++                Haptics.error()
++                showToast(failure, tone: .warning)
++                return
++            }
++            Haptics.success()
++            await refreshSessions()
++            showToast(String(localized: "已删除"), tone: .success)
++        } catch {
++            Haptics.error()
++            showToast(error.localizedDescription, tone: .warning)
++        }
++    }
++
++    /// The route's own words for a refusal: 409 means the session is still writing.
++    private static func deleteFailure(status: Int, data: Data) -> String {
++        let code = (try? JSON.parse(data))?["error"].string
++        switch code {
++        case "session-active": return String(localized: "这个会话还在运行，先切换到别的对话再删")
++        case "not-found": return String(localized: "磁盘上找不到这个会话")
++        case "bad-session-id": return String(localized: "会话 ID 不正确")
++        default: return status == 404
++            ? String(localized: "引擎没有删除会话的入口（请更新 App）")
++            : String(localized: "删除失败（HTTP \(status)）")
++        }
++    }
++
+     func unarchive(_ id: String) async {
+         do {
+             try await client.call("workspace/unarchiveSession", ["request": ["sessionId": .string(id)]])
+diff --git a/app/DshIOS/Views/DrawerView.swift b/app/DshIOS/Views/DrawerView.swift
+index d08fb9c..767d36b 100644
+--- a/app/DshIOS/Views/DrawerView.swift
++++ b/app/DshIOS/Views/DrawerView.swift
+@@ -1171,6 +1171,13 @@ struct DrawerView: View {
+         }
+         // No full swipe: a long leftward swipe is how the drawer closes, and must not archive.
+         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
++            Button(role: .destructive) {
++                Haptics.tap()
++                app.deleteRequest = DeleteSessionRequest(sessionId: session.id, title: app.durableTitle(of: session.id) ?? "")
++            } label: {
++                Label("删除", systemImage: "trash")
++            }
++            .tint(.red)
+             Button {
+                 Haptics.tap()
+                 Task { if archived { await app.unarchive(session.id) } else { await app.archive(session.id) } }
+@@ -1315,6 +1322,9 @@ struct DrawerView: View {
+         Button {
+             Task { if archived { await app.unarchive(session.id) } else { await app.archive(session.id) } }
+         } label: { Label(archived ? "取消归档" : "归档会话", systemImage: archived ? "tray.and.arrow.up" : "archivebox") }
++        Button(role: .destructive) {
++            app.deleteRequest = DeleteSessionRequest(sessionId: session.id, title: app.durableTitle(of: session.id) ?? "")
++        } label: { Label("删除会话", systemImage: "trash") }
+         Button { app.copySessionId(session.id) } label: { Label("复制会话 ID", systemImage: "doc.on.doc") }
+     }
+ }
+diff --git a/app/DshIOS/Views/ShellDialogs.swift b/app/DshIOS/Views/ShellDialogs.swift
+index 7f42649..0af01e8 100644
+--- a/app/DshIOS/Views/ShellDialogs.swift
++++ b/app/DshIOS/Views/ShellDialogs.swift
+@@ -24,6 +24,10 @@ struct ShellDialogs: ViewModifier {
+         Binding(get: { app.archiveRequest != nil }, set: { if !$0 { app.archiveRequest = nil } })
+     }
+ 
++    private var deleting: Binding<Bool> {
++        Binding(get: { app.deleteRequest != nil }, set: { if !$0 { app.deleteRequest = nil } })
++    }
++
+     func body(content: Content) -> some View {
+         content
+             // The text is in place before the alert reads it.
+@@ -38,6 +42,12 @@ struct ShellDialogs: ViewModifier {
+                 Button("重命名", action: saveTitle).disabled(trimmed.isEmpty)
+             }
+             .sheet(item: workspaceRename) { RenameWorkspaceSheet(request: $0) }
++            .confirmationDialog(Text("彻底删除「\(app.deleteRequest?.title ?? "")」？"), isPresented: deleting, titleVisibility: .visible, presenting: app.deleteRequest) { request in
++                Button("彻底删除", role: .destructive) { delete(request) }
++                Button("取消", role: .cancel) {}
++            } message: { _ in
++                Text("会话日志、缓存和侧栏条目都会移除，无法恢复。")
++            }
+             .confirmationDialog(Text("停止并归档「\(app.archiveRequest?.title ?? "")」？"), isPresented: archiving, titleVisibility: .visible, presenting: app.archiveRequest) { request in
+                 Button("停止并归档", role: .destructive) { stopAndArchive(request) }
+                 Button("取消", role: .cancel) {}
+@@ -71,6 +81,11 @@ struct ShellDialogs: ViewModifier {
+         }
+     }
+ 
++    private func delete(_ request: DeleteSessionRequest) {
++        app.deleteRequest = nil
++        Task { await app.deleteSession(request.sessionId) }
++    }
++
+     private func stopAndArchive(_ request: ArchiveRequest) {
+         Task {
+             do {
+diff --git a/engine/ios.patch.yml b/engine/ios.patch.yml
+index de71ecc..8f3dbf3 100644
+--- a/engine/ios.patch.yml
++++ b/engine/ios.patch.yml
+@@ -84,3 +84,7 @@
+     # own providers and refuse every edit to them (plugins/fish-pocket).
+     - id: fish-pocket
+       name: ./plugins/fish-pocket/index.mjs
++    # 删除会话：抽屉里右划/长按「删除」时调用（plugins/session-delete）。会话日志、
++    # 投影缓存和 workspace registry 里的登记一起清，否则侧栏会留下点了还在的行。
++    - id: session-delete
++      name: ./plugins/session-delete/index.mjs
+diff --git a/engine/plugins/session-delete/index.mjs b/engine/plugins/session-delete/index.mjs
+new file mode 100644
+index 0000000..32ae206
+--- /dev/null
++++ b/engine/plugins/session-delete/index.mjs
+@@ -0,0 +1,191 @@
++// Engine side of 「删除会话」: the drawer's swipe action and long-press menu ask for
++// one session to be gone for good, and this is the only thing that may touch the
++// three places a session lives in.
++//
++// A row is not a file: the drawer renders the workspace registry (in memory, plus
++// `~/.dsh/storages/workspace.json`), so unlinking the log alone leaves a ghost row
++// that survives every refresh. The registry therefore has to be told too, through
++// its own write chain — `detachSession` / `unpinSession` / `unarchiveSession` — because
++// editing the JSON behind its back is overwritten by the next write.
++//
++// The route is plain HTTP on the engine's own web server, next to `/api/*`: the app
++// already holds the origin and the session cookie, and a route needs no generated
++// RPC schema. Requests are same-origin from the app only.
++import { existsSync, readdirSync, rmSync, statSync } from 'node:fs';
++import path from 'node:path';
++import os from 'node:os';
++
++export const name = 'session-delete';
++export const inject = ['webServer'];
++
++/** `session-<uuid>`; anything else (a path, a title, an empty string) is refused. */
++const SESSION_RE = /^session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
++/** A session written to in the last minute is still running: refuse rather than race it. */
++const ACTIVE_WINDOW_MS = 60 * 1000;
++const BODY_LIMIT = 4 * 1024;
++
++function dshHome() {
++  return process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh');
++}
++
++function sendJson(response, status, value) {
++  response.writeHead(status, { 'cache-control': 'no-store', 'content-type': 'application/json; charset=utf-8' });
++  response.end(JSON.stringify(value));
++}
++
++function readJson(request) {
++  return new Promise((resolve, reject) => {
++    const chunks = [];
++    let size = 0;
++    request.on('data', (chunk) => {
++      size += chunk.length;
++      if (size > BODY_LIMIT) {
++        reject(new Error('body-too-large'));
++        request.destroy();
++        return;
++      }
++      chunks.push(chunk);
++    });
++    request.on('end', () => {
++      try {
++        resolve(chunks.length === 0 ? {} : JSON.parse(Buffer.concat(chunks).toString('utf8')));
++      } catch {
++        reject(new Error('bad-json'));
++      }
++    });
++    request.on('error', reject);
++  });
++}
++
++/** Newest write under one session directory; 0 when it cannot be read. */
++function newestWrite(dir) {
++  let newest = 0;
++  for (const entry of readdirSync(dir)) {
++    try {
++      newest = Math.max(newest, statSync(path.join(dir, entry)).mtimeMs);
++    } catch {
++      // A file removed while we look: the next one decides.
++    }
++  }
++  return newest;
++}
++
++/** Every place this session is stored. */
++function locate(home, sessionId) {
++  const targets = [];
++  const root = path.join(home, 'sessions');
++  if (existsSync(root)) {
++    for (const workspace of readdirSync(root)) {
++      const workspaceDir = path.join(root, workspace);
++      if (!existsSync(workspaceDir)) continue;
++      for (const entry of readdirSync(workspaceDir)) {
++        if (entry === sessionId || entry.startsWith(sessionId)) targets.push(path.join(workspaceDir, entry));
++      }
++    }
++  }
++  const cache = path.join(home, 'storages', 'session_projcache', 'sessions', `${sessionId}.json`);
++  if (existsSync(cache)) targets.push(cache);
++  return targets;
++}
++
++/** Drop the session from the workspace registry (the drawer's own data). */
++async function forgetInRegistry(registry, sessionId) {
++  if (registry === undefined || registry === null) return -1;
++  const result = { detached: 0 };
++  try {
++    await registry.unpinSession(sessionId);
++  } catch {
++    // Not pinned.
++  }
++  try {
++    await registry.unarchiveSession(sessionId);
++  } catch {
++    // Not archived.
++  }
++  try {
++    for (const workspace of registry.list()) {
++      if ((workspace.sessionIds ?? []).includes(sessionId)) {
++        await workspace.detachSession(sessionId);
++        result.detached += 1;
++      }
++    }
++  } catch {
++    // Keep what already succeeded.
++  }
++  return result;
++}
++
++/** The one deletion path; the route below is its only caller. */
++export async function deleteSession({ home, registry, sessionId }) {
++  if (typeof sessionId !== 'string' || !SESSION_RE.test(sessionId)) return { ok: false, error: 'bad-session-id' };
++
++  const targets = locate(home, sessionId);
++  if (targets.length === 0) {
++    const cleaned = await forgetInRegistry(registry, sessionId);
++    return { ok: cleaned !== -1, error: cleaned === -1 ? 'not-found' : undefined, files: 0, registry: cleaned };
++  }
++
++  const now = Date.now();
++  for (const target of targets) {
++    try {
++      if (statSync(target).isDirectory() && now - newestWrite(target) < ACTIVE_WINDOW_MS) {
++        return { ok: false, error: 'session-active' };
++      }
++    } catch {
++      // Gone already; continue.
++    }
++  }
++
++  const removed = [];
++  for (const target of targets) {
++    rmSync(target, { recursive: true, force: true });
++    removed.push(target);
++  }
++
++  const cleaned = await forgetInRegistry(registry, sessionId);
++  return { ok: true, sessionId, removed, registry: cleaned };
++}
++
++export function apply(ctx) {
++  const registry = () => {
++    try {
++      return ctx.get?.('workspaceRegistry');
++    } catch {
++      return undefined;
++    }
++  };
++
++  ctx.inject?.(['webServer'], (host) => {
++    const mount = () =>
++      host.webServer.register({
++        kind: 'exact',
++        path: '/session-delete/delete',
++        handler: async (request, response) => {
++          if (request.method !== 'POST') {
++            sendJson(response, 405, { ok: false, error: 'method-not-allowed' });
++            return;
++          }
++          let body;
++          try {
++            body = await readJson(request);
++          } catch (error) {
++            sendJson(response, 400, { ok: false, error: String(error.message ?? error) });
++            return;
++          }
++          // The registry is read per request: it may publish after this plugin mounts.
++          const result = await deleteSession({
++            home: dshHome(),
++            registry: registry() ?? host.workspaceRegistry,
++            sessionId: body?.sessionId,
++          });
++          if (result.ok) sendJson(response, 200, result);
++          else if (result.error === 'session-active') sendJson(response, 409, result);
++          else if (result.error === 'bad-session-id') sendJson(response, 400, result);
++          else sendJson(response, 404, result);
++        },
++      });
++
++    if (typeof host.effect === 'function') host.effect(mount, 'session-delete: route');
++    else mount();
++  });
++}
